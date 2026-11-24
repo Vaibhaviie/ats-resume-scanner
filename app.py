@@ -8,7 +8,7 @@ from matcher.interview import generate_interview_questions
 from matcher.layout_detector import detect_layout_warnings
 from matcher.parser import extract_text
 from matcher.scorer import calculate_match
-from matcher.skills_advisor import generate_skill_advice
+from matcher.skills_advisor import find_missing_skills
 
 # Configure the Streamlit page with a responsive, modern layout
 st.set_page_config(
@@ -50,7 +50,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("v1.5 • Powered by Streamlit & Sentence-Transformers")
+    st.caption("v1.6 • Powered by Streamlit & Sentence-Transformers")
 
 # ---------------------------------------------------------
 # Main Page Header
@@ -164,7 +164,8 @@ if start_matching:
                 "final_score": match_res["final_score"],
                 "keyword_score": match_res["keyword_score"],
                 "semantic_score": match_res["semantic_score"],
-                "missing_keywords": match_res["missing_keywords"]
+                "missing_keywords": match_res["missing_keywords"],
+                "missing_skills": match_res.get("missing_skills", [])
             })
 
         progress_bar.progress(100, text="Finalizing rankings...")
@@ -207,7 +208,7 @@ if "comparison_results" in st.session_state and st.session_state["comparison_res
             "Overall Score": f"{score}%",
             "Keyword Match": f"{res['keyword_score']}%",
             "Semantic Match": semantic_val,
-            "Top Missing Keywords": missing_preview,
+            "Top Missing Skills": missing_preview,
             "Recommendation": rec
         })
 
@@ -256,7 +257,6 @@ if "comparison_results" in st.session_state and st.session_state["comparison_res
         passed_count = sum(1 for c in ats_results if c["passed"])
         total_checks = len(ats_results)
 
-        # ATS Readiness Progress
         readiness_pct = int((passed_count / total_checks) * 100) if total_checks > 0 else 0
         st.progress(readiness_pct / 100.0, text=f"ATS Readiness Score: {passed_count}/{total_checks} Checks Passed ({readiness_pct}%)")
 
@@ -316,35 +316,45 @@ if "comparison_results" in st.session_state and st.session_state["comparison_res
                     st.markdown(f"**{title}:** " + ", ".join([f"`{v}`" for v in verbs]))
 
     # -----------------------------------------------------
-    # Missing Skills & Placement Guidance
+    # Missing Skills & How-to-Add Guide (Compact Table)
     # -----------------------------------------------------
-    missing_keywords = selected_job["missing_keywords"]
-    with st.expander(f"🔑 Missing Skills & How-to-Add Guide ({len(missing_keywords)} skills)", expanded=True):
-        if missing_keywords:
-            st.warning(
-                "⚠️ **Resume Integrity Rule:** Only add skills you actually have! "
-                "Never invent experience or list tools you cannot discuss in an interview."
-            )
+    missing_skills = selected_job.get("missing_skills", [])
+    if not missing_skills:
+        missing_skills = find_missing_skills(active_resume, selected_job["description"], max_skills=8)
 
-            # Display quick chips
-            st.markdown(" ".join([f"`{k}`" for k in missing_keywords]))
-            st.write("")
+    st.subheader(f"🔑 Missing Skills ({len(missing_skills)})")
 
-            skill_advice = generate_skill_advice(missing_keywords)
-            for adv in skill_advice:
-                with st.expander(f"📌 **{adv['skill'].title()}** — Recommended Section: *{adv['section']}*"):
-                    st.markdown(f"**Where it belongs:** `{adv['section']}`")
-                    st.markdown(f"**If you have this skill:** {adv['how_to_add']}")
-                    st.markdown(f"**If you don't have it yet:** {adv['how_to_learn']}")
-        else:
-            st.success(f"No key keywords from '{selected_job['title']}' are missing in your resume!")
+    if missing_skills:
+        # One short line integrity warning
+        st.markdown("⚠️ *Integrity Rule: Only add skills you actually have.*")
+
+        # Display clean badges for missing skills
+        st.markdown(" ".join([f"`{item['skill']}`" for item in missing_skills]))
+        st.write("")
+
+        # Compact table: Skill | Required or Preferred | Best section to add it
+        table_records = [
+            {
+                "Skill": item["skill"],
+                "Required or Preferred": item["level"],
+                "Best section to add it": item["best_section"]
+            }
+            for item in missing_skills
+        ]
+        df_skills = pd.DataFrame(table_records)
+        st.dataframe(df_skills, use_container_width=True, hide_index=True)
+    else:
+        st.success("🎉 Excellent match! No key skills from this job description are missing from your resume.")
+
+    st.write("")
 
     # -----------------------------------------------------
     # Interview Preparation Section (8 Likely Questions)
     # -----------------------------------------------------
     with st.expander(f"🎯 Interview Preparation: {selected_job['title']} (8 Questions)", expanded=True):
         st.caption("Tailored interview questions based on job description requirements and your resume gaps.")
-        interview_data = generate_interview_questions(selected_job["description"], active_resume, missing_keywords)
+        missing_kw_list = [item["skill"] for item in missing_skills]
+        interview_data = generate_interview_questions(selected_job["description"], active_resume, missing_kw_list)
 
         tab_t, tab_b, tab_g = st.tabs([
             f"🛠️ Technical ({len(interview_data['technical'])})",
