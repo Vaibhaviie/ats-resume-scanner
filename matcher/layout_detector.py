@@ -1,44 +1,45 @@
 import re
-from typing import Any, Dict, List
+from typing import Dict, List
 import docx
 import pdfplumber
 
+MAX_INSPECT_PAGES = 10
+
 
 def detect_layout_warnings(uploaded_file, extracted_text: str = "") -> List[Dict[str, str]]:
-    """Inspects an uploaded PDF or DOCX file (and its extracted text) for ATS pitfalls:
+    """Inspect an uploaded PDF or DOCX file for common ATS layout pitfalls.
 
-    - Tables
-    - Multiple columns
-    - Text inside images / graphics
-    - Headers and footers
-    - Text that appears jumbled or out of order
+    Checks for tables, multiple columns, embedded images/graphics,
+    headers/footers, and jumbled/fragmented reading order.
     """
     if uploaded_file is None:
         return []
 
-    filename = getattr(uploaded_file, "name", "").lower()
+    filename = (getattr(uploaded_file, "name", "") or "").lower()
     warnings: List[Dict[str, str]] = []
 
-    # Reset seek pointer
     if hasattr(uploaded_file, "seek"):
-        uploaded_file.seek(0)
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
 
     has_tables = False
     has_columns = False
     has_images = False
     has_headers_footers = False
     has_jumbled = False
+    inspected_file_structure = False
 
     # 1. Inspection for DOCX files
     if filename.endswith(".docx"):
         try:
             doc = docx.Document(uploaded_file)
+            inspected_file_structure = True
 
-            # Check tables
             if len(doc.tables) > 0:
                 has_tables = True
 
-            # Check images / shapes
             if len(doc.inline_shapes) > 0:
                 has_images = True
             elif hasattr(doc, "_element") and doc._element is not None:
@@ -46,7 +47,6 @@ def detect_layout_warnings(uploaded_file, extracted_text: str = "") -> List[Dict
                 if "<w:drawing" in xml_str or "<w:pict" in xml_str:
                     has_images = True
 
-            # Check headers and footers
             for s in doc.sections:
                 header_text = "".join(p.text.strip() for p in s.header.paragraphs)
                 footer_text = "".join(p.text.strip() for p in s.footer.paragraphs)
@@ -54,7 +54,6 @@ def detect_layout_warnings(uploaded_file, extracted_text: str = "") -> List[Dict
                     has_headers_footers = True
                     break
 
-            # Check multiple columns & text boxes
             for s in doc.sections:
                 if hasattr(s, "_sectPr") and s._sectPr is not None:
                     sect_xml = s._sectPr.xml
@@ -62,7 +61,6 @@ def detect_layout_warnings(uploaded_file, extracted_text: str = "") -> List[Dict
                         has_columns = True
                         break
 
-            # Text boxes in DOCX often cause out-of-order text
             if hasattr(doc, "_element") and doc._element is not None:
                 if "<w:txbxContent" in doc._element.xml:
                     has_jumbled = True
@@ -74,8 +72,8 @@ def detect_layout_warnings(uploaded_file, extracted_text: str = "") -> List[Dict
     elif filename.endswith(".pdf"):
         try:
             with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-                    # Check tables
+                inspected_file_structure = True
+                for page in pdf.pages[:MAX_INSPECT_PAGES]:
                     if not has_tables:
                         try:
                             tables = page.find_tables()
@@ -84,65 +82,94 @@ def detect_layout_warnings(uploaded_file, extracted_text: str = "") -> List[Dict
                         except Exception:
                             pass
 
-                    # Check images
                     if not has_images and getattr(page, "images", None):
                         if len(page.images) > 0:
                             has_images = True
 
-                    # Check headers and footers (top/bottom margin text)
-                    if not has_headers_footers:
+                    words = None
+                    try:
                         words = page.extract_words()
-                        top_words = [w for w in words if w.get("top", 100) < 45]
+                    except Exception:
+                        words = []
+
+                    # Standard 0.5-inch margins are 36pt; only flag < 28pt as header/footer zone
+                    if not has_headers_footers and words:
+                        top_words = [w for w in words if w.get("top", 100) < 28]
                         bottom_words = [
-                            w for w in words if w.get("bottom", 0) > (page.height - 45)
+                            w for w in words if w.get("bottom", 0) > (page.height - 28)
                         ]
                         if top_words or bottom_words:
                             has_headers_footers = True
 
-                    # Check multi-column layout via word coordinates
-                    if not has_columns:
-                        words = page.extract_words()
-                        if words and len(words) > 30:
-                            mid_x = page.width / 2
-                            left_words = [w for w in words if w.get("x1", 0) < mid_x - 15]
-                            right_words = [w for w in words if w.get("x0", 0) > mid_x + 15]
-                            if len(left_words) > 15 and len(right_words) > 15:
-                                # Overlapping vertical coordinates between columns
-                                left_y_span = (min(w["top"] for w in left_words), max(w["bottom"] for w in left_words))
-                                right_y_span = (min(w["top"] for w in right_words), max(w["bottom"] for w in right_words))
-                                if max(left_y_span[0], right_y_span[0]) < min(left_y_span[1], right_y_span[1]):
-                                    has_columns = True
+                    # Multi-column check: ignore sparse right-aligned dates
+                    if not has_columns and words and len(words) > 40:
+                        mid_x = page.width / 2
+                        left_words = [w for w in words if w.get("x1", 0) < mid_x - 20]
+                        right_words = [w for w in words if w.get("x0", 0) > mid_x + 20]
+                        if len(left_words) > 25 and len(right_words) > 25:
+                            # Group right-side words by vertical line (~4pt bucket) to distinguish
+                            # right-aligned dates (1-3 tokens per line) from real prose columns
+                            right_lines: Dict[int, int] = {}
+                            for w in right_words:
+                                y_key = int(round(w.get("top", 0) / 5.0))
+                                right_lines[y_key] = right_lines.get(y_key, 0) + 1
+                            avg_right_per_line = sum(right_lines.values()) / max(1, len(right_lines))
+
+                            left_y_span = (
+                                min(w["top"] for w in left_words),
+                                max(w["bottom"] for w in left_words),
+                            )
+                            right_y_span = (
+                                min(w["top"] for w in right_words),
+                                max(w["bottom"] for w in right_words),
+                            )
+                            overlaps_vertically = max(left_y_span[0], right_y_span[0]) < min(
+                                left_y_span[1], right_y_span[1]
+                            )
+                            if overlaps_vertically and avg_right_per_line >= 3.0 and len(right_lines) >= 6:
+                                has_columns = True
         except Exception:
             pass
 
-    # 3. Fallback / Text-based heuristics
+    # 3. Text-based heuristics (only when structural clues are absent or for text boxes)
     if extracted_text:
         lines = [line.strip() for line in extracted_text.splitlines() if line.strip()]
 
-        # Table heuristic in plain text (tab separators or table borders)
         if not has_tables:
-            if any("\t" in line or bool(re.search(r"(\|[^\n]+\|)", line)) for line in lines):
+            # Look for multiple lines with pipe-delimited cells or tabs
+            tab_or_pipe_lines = sum(
+                1 for line in lines if "\t" in line or bool(re.search(r"\|[^|\n]+\|", line))
+            )
+            if tab_or_pipe_lines >= 2:
                 has_tables = True
 
-        # Multi-column heuristic: lines with wide spacing gaps between words
-        if not has_columns:
-            if any(re.search(r"[A-Za-z0-9,.-]{2,}\s{5,}[A-Za-z0-9,.-]{2,}", line) for line in lines[:60]):
+        if not has_columns and not inspected_file_structure:
+            wide_gap_lines = sum(
+                1
+                for line in lines[:60]
+                if re.search(r"[A-Za-z0-9,.-]{3,}\s{6,}[A-Za-z0-9,.-]{3,}", line)
+            )
+            if wide_gap_lines >= 4:
                 has_columns = True
 
-        # Jumbled or fragmented text heuristic: unusually high percentage of 1-2 word lines
-        if not has_jumbled and len(lines) >= 12:
+        # Jumbled text heuristic: high percentage of disconnected 1-2 word fragments
+        if not has_jumbled and len(lines) >= 16:
             short_fragments = [
-                line for line in lines
-                if len(line.split()) <= 2 and not line.startswith(("-", "•", "*", "–", "—"))
+                line
+                for line in lines
+                if len(line.split()) <= 2
+                and not line.startswith(("-", "•", "*", "–", "—"))
+                and not line.endswith(":")
             ]
-            if len(short_fragments) / len(lines) > 0.45:
+            if len(short_fragments) / len(lines) > 0.58:
                 has_jumbled = True
 
-    # Reset seek pointer before returning
     if hasattr(uploaded_file, "seek"):
-        uploaded_file.seek(0)
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
 
-    # Compile structured warnings with clear fixes
     if has_tables:
         warnings.append({
             "issue": "Tables Detected",
